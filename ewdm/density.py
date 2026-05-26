@@ -9,6 +9,11 @@ import logging
 
 from .parameters import VARIABLE_NAMES
 
+# numpy 2.0 renamed `np.trapz` to `np.trapezoid` and removed the old
+# name. Use the new name when available and fall back on older numpy.
+_trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
+
 # von mises kernel desnsity estimation
 def _vonmises_kde(arr, bins, kappa):
     """Return Kernel-Density Estimation using von Mises distribution"""
@@ -20,7 +25,7 @@ def _vonmises_kde(arr, bins, kappa):
     kde = (
         np.exp(kappa * np.cos(x)).sum(axis=1) / (2 * np.pi * np.i0(kappa))
     )
-    kde /= np.trapz(kde, x=bins)
+    kde /= _trapezoid(kde, x=bins)
     return kde
 
 
