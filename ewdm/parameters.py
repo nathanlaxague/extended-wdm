@@ -24,7 +24,7 @@ VARIABLE_NAMES = {
      },
      'frequency_spectrum': {
          'standard_name': 'sea_surface_frequency_wave_spectrum',
-         'long_name': 'Azimutally-integrated wave energy density spectrum',
+         'long_name': 'Azimuthally-integrated wave energy density spectrum',
          'units': 'm^2/Hz'
      },
      'directional_spectrum': {
@@ -36,6 +36,26 @@ VARIABLE_NAMES = {
          'standard_name': 'sea_surface_wave_directional_distribution_function',
          'long_name': 'Directional distribution function of wave energy',
          'units': 'dimensionless'
+     },
+     'wavenumber': {
+         'standard_name': 'sea_surface_wave_wavenumber',
+         'long_name': 'Wavenumber magnitude',
+         'units': 'rad/m'
+     },
+     'nu': {
+         'standard_name': 'sea_surface_wave_inverse_phase_speed',
+         'long_name': 'Inverse phase speed (nu = k / omega)',
+         'units': 's/m'
+     },
+     'wavenumber_spectrum': {
+         'standard_name': 'sea_surface_wavenumber_wave_spectrum',
+         'long_name': 'Omnidirectional wavenumber wave spectrum F(k)',
+         'units': 'm^3'
+     },
+     'nu_spectrum': {
+         'standard_name': 'sea_surface_inverse_phase_speed_wave_spectrum',
+         'long_name': 'Omnidirectional inverse-phase-speed wave spectrum Q(nu)',
+         'units': 'm^3/s'
      },
     'surface_elevation': {
         'standard_name': 'sea_surface_wave_elevation',

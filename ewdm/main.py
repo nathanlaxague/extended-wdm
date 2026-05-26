@@ -9,7 +9,7 @@ import logging
 from tqdm import tqdm
 
 from .wavelets import cwt, xwt
-from .density import estimate_directional_distribution
+from .density import estimate_directional_distribution, estimate_radial_distribution
 from .helpers import get_sampling_frequency
 from .sources import SpotterBuoysDataSource, CDIPDataSourceRealTime
 from .parameters import VARIABLE_NAMES
@@ -425,16 +425,57 @@ class Arrays(_BaseClass):
             coords={"frequency": self.freqs, "time": _dataset["time"]},
         )
 
+        # local wavenumber magnitude k = |(kx, ky)| in rad/m. This is
+        # solved from the spatial phase gradients and is therefore an
+        # observed quantity, independent of any dispersion assumption.
+        wavenumber = xr.DataArray(
+            np.hypot(kx, ky),
+            dims = ["frequency", "time"],
+            coords={"frequency": self.freqs, "time": _dataset["time"]},
+        )
+
+        # local inverse phase speed nu = k / omega = k / (2 pi f),
+        # following Björkqvist et al. (2019), in s/m.
+        omega = 2 * np.pi * self.freqs
+        nu = wavenumber / xr.DataArray(
+            omega, dims=["frequency"], coords={"frequency": self.freqs}
+        )
+
         # compute wavelet power from wavelet coefficients
         data_std = _dataset["surface_elevation"].std("time")
         power = np.abs(coeffs) ** 2
         if self.normalise:
             wavelet_energy = power.mean("time").integrate("frequency")**0.5
             mean_power = (power * data_std / wavelet_energy).mean("element")
-        
-        return estimate_directional_distribution(
-            mean_power, theta, dd=self.dd, kappa=self.kappa
-        )
+        else:
+            mean_power = power.mean("element")
+
+        # frequency-direction spectrum (default, unchanged behaviour)
+        if self.coordinate in ("frequency", None):
+            return estimate_directional_distribution(
+                mean_power, theta, dd=self.dd, kappa=self.kappa
+            )
+
+        # wavenumber-direction or inverse-phase-speed-direction spectrum
+        elif self.coordinate == "wavenumber":
+            return estimate_radial_distribution(
+                mean_power, theta, wavenumber, "wavenumber",
+                bins_radial=self.bins_radial,
+                dd=self.dd, kappa=self.kappa, bandwidth=self.bandwidth
+            )
+
+        elif self.coordinate == "nu":
+            return estimate_radial_distribution(
+                mean_power, theta, nu, "nu",
+                bins_radial=self.bins_radial,
+                dd=self.dd, kappa=self.kappa, bandwidth=self.bandwidth
+            )
+
+        else:
+            raise Exception(
+                "`coordinate` should be either `frequency`, "
+                "`wavenumber` or `nu`."
+            )
 
 
     def compute(
@@ -449,6 +490,9 @@ class Arrays(_BaseClass):
             kappa: float = 36.0,
             use: str = "displacements",
             block_size: str = "30min",
+            coordinate: str = "frequency",
+            bins_radial: np.ndarray = None,
+            bandwidth: str = "silverman",
         ) -> xr.Dataset:
         """Perform computation using specified parameters.
 
@@ -483,6 +527,21 @@ class Arrays(_BaseClass):
                 computation over each block. The resulting output will have a
                 time dimension. It is advisable to choose values of no more than
                 half-hour. Default `block_size="30min"`.
+            coordinate (str, optional): Independent radial coordinate of the
+                output spectrum. One of `frequency` (default, the usual
+                frequency-direction spectrum), `wavenumber`, or `nu` (the
+                inverse phase speed nu = k / omega, yielding the Q(nu, theta)
+                spectrum of Björkqvist et al., 2019). The latter two are
+                available only for `Arrays` because they rely on the
+                wavenumber vector solved from the spatial phase gradients.
+            bins_radial (np.ndarray, optional): Bin centres for the radial
+                axis when `coordinate` is `wavenumber` (rad/m) or `nu`
+                (s/m). If None, a sensible range is derived from the data.
+                Ignored when `coordinate="frequency"`.
+            bandwidth (str or float, optional): Bandwidth for the Gaussian
+                kernel used along the radial axis. Either a number or the
+                string `silverman` (default). Ignored when
+                `coordinate="frequency"`.
 
         Returns:
             xr.Dataset: Dataset containing the directional spectrum, directional
@@ -512,6 +571,32 @@ class Arrays(_BaseClass):
         # data used for estimation
         self.use = use
         self.block_size = block_size
+
+        # radial coordinate of the output spectrum
+        self.coordinate = coordinate
+        self.bandwidth = bandwidth
+
+        # default radial bins if none are provided. The resolutions
+        # follow Björkqvist et al. (2019): dk = 1/12 rad/m and
+        # dnu = 1/50 s/m. The grids start one bin-width above zero so the
+        # polar directional spectrum (which carries a 1/r Jacobian) has no
+        # singular bin at the origin. The upper bounds follow the
+        # practical cutoffs used by Björkqvist et al. (2019), who binned
+        # the inverse phase speed spectrum only for k < 9 rad/m because of
+        # high noise near the Nyquist wavenumber. The corresponding nu
+        # cutoff is nu = k / omega evaluated at the lowest resolved
+        # frequency, which bounds the slowest (largest-nu) waves.
+        if bins_radial is None and coordinate == "wavenumber":
+            dk = 1.0 / 12.0
+            kmax = 9.0
+            self.bins_radial = np.arange(dk, kmax + dk, dk)
+        elif bins_radial is None and coordinate == "nu":
+            dnu = 1.0 / 50.0
+            nu_max = 9.0 / (2 * np.pi * self.freqs[0])
+            nu_max = min(nu_max, 2.0)  # cap at a physically reasonable slowness
+            self.bins_radial = np.arange(dnu, nu_max + dnu, dnu)
+        else:
+            self.bins_radial = bins_radial
 
         # determine length of time series
         # if dataset contains more than one hour of data, it will be splitted
