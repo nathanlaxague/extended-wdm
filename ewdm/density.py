@@ -93,7 +93,7 @@ def estimate_directional_distribution(power, theta, dd, kappa):
 
 
 # kernel density estimation along a radial (non-periodic) axis {{{
-def _gaussian_radial_kde(arr, bins, bandwidth="silverman"):
+def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None):
     """Return Gaussian Kernel-Density Estimation along a radial axis.
 
     Unlike the directional case, the radial coordinate (wavenumber or
@@ -108,6 +108,16 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman"):
         bandwidth (str or float): Either a number giving the kernel
             bandwidth or the string ``silverman`` to use Silverman's
             rule of thumb (default).
+        bandwidth_floor (float, optional): Optional physical lower bound on
+            the kernel bandwidth, in the units of the radial coordinate.
+            When given, the bandwidth is never allowed to fall below this
+            value. Intended for callers who want to impose a known
+            resolution limit; note this should be a *kernel width*, not an
+            aperture wavelength such as ``2*pi / L_baseline`` (which is far
+            wider than a sensible kernel and over-smooths). If None, the
+            data-driven (Silverman) bandwidth is used and only floored at
+            the local bin spacing to keep the kernel resolvable for
+            degenerate, near-zero-spread samples.
 
     Returns:
         np.ndarray: Normalised density evaluated at `bins`.
@@ -119,10 +129,16 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman"):
     # the Silverman bandwidth collapses to zero when the radial samples
     # have little or no spread (e.g. a near-monochromatic sea state). In
     # that case the Gaussian kernel becomes a delta function that misses
-    # the discrete `bins` grid, so we floor the bandwidth at the local
-    # bin spacing to keep the kernel resolvable.
-    bin_spacing = np.median(np.diff(bins)) if len(bins) > 1 else 1.0
-    bandwidth = max(bandwidth, bin_spacing)
+    # the discrete `bins` grid. We floor the bandwidth so the kernel stays
+    # resolvable. An explicit `bandwidth_floor` (a kernel width) may be
+    # supplied by the caller to impose a known resolution limit; otherwise
+    # we fall back to the local bin spacing, which keeps the kernel
+    # resolvable without biasing the well-sampled, broadband case.
+    if bandwidth_floor is not None and np.isfinite(bandwidth_floor):
+        bandwidth = max(bandwidth, float(bandwidth_floor))
+    else:
+        bin_spacing = np.median(np.diff(bins)) if len(bins) > 1 else 1.0
+        bandwidth = max(bandwidth, bin_spacing)
 
     # guard against a degenerate (zero-spread) sample
     if bandwidth == 0 or not np.isfinite(bandwidth):
@@ -143,19 +159,20 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman"):
 
 
 # function to get radial density along the frequency axis
-def _get_radial_density(arr, bins, bandwidth):
+def _get_radial_density(arr, bins, bandwidth, bandwidth_floor=None):
     if np.isnan(arr).all():
         return np.zeros_like(bins, dtype="float") * np.nan
     else:
         return _gaussian_radial_kde(arr[~np.isnan(arr)], bins=bins,
-                                    bandwidth=bandwidth)
+                                    bandwidth=bandwidth,
+                                    bandwidth_floor=bandwidth_floor)
 # }}}
 
 
 # estimate spectrum on a (radial, direction) grid {{{
 def estimate_radial_distribution(
         power, theta, radial, radial_name, bins_radial,
-        dd, kappa, bandwidth="silverman"
+        dd, kappa, bandwidth="silverman", bandwidth_floor=None
     ):
     """Construct a directional spectrum on a (radial, direction) grid.
 
@@ -190,6 +207,12 @@ def estimate_radial_distribution(
             along the directional axis.
         bandwidth (str or float): Bandwidth for the Gaussian kernel used
             along the radial axis. Default is Silverman's rule.
+        bandwidth_floor (float, optional): Physical lower bound on the
+            radial-kernel bandwidth (e.g. the array wavenumber resolution
+            ``2*pi / L_baseline`` for wavenumber, or its slowness
+            equivalent for ``nu``). Prevents the smoothed spectrum from
+            implying structure finer than the array can resolve. When
+            None, the kernel is floored at the local bin spacing instead.
 
     Returns:
         xr.Dataset: Dataset containing the directional spectrum
@@ -213,7 +236,7 @@ def estimate_radial_distribution(
     # the non-periodic radial axis
     R = np.apply_along_axis(
         _get_radial_density, arr=np.asarray(radial), bins=bins_radial,
-        bandwidth=bandwidth, axis=1
+        bandwidth=bandwidth, bandwidth_floor=bandwidth_floor, axis=1
     )
 
     # average wavelet power per frequency, S(f). This is the same
