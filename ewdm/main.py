@@ -9,7 +9,7 @@ import logging
 from tqdm import tqdm
 
 from .wavelets import cwt, xwt
-from .density import estimate_directional_distribution
+from .density import estimate_directional_distribution, estimate_radial_distribution
 from .helpers import get_sampling_frequency
 from .sources import SpotterBuoysDataSource, CDIPDataSourceRealTime
 from .parameters import VARIABLE_NAMES
@@ -389,6 +389,18 @@ class Arrays(_BaseClass):
         # array geometry
         dx = self.array_geometry(_dataset)
 
+        # Largest baseline (maximum pairwise separation) of the array, in
+        # metres. The coarsest wavenumber the array can resolve is of order
+        # 2*pi / L_baseline. This is exposed as `self._L_baseline` so a
+        # caller can, if they wish, choose an explicit `bandwidth_floor`
+        # informed by the array geometry; it is not applied automatically,
+        # because an aperture wavelength is far wider than a sensible KDE
+        # kernel and would over-smooth the spectrum.
+        if dx.size:
+            self._L_baseline = float(np.max(np.hypot(dx[:, 0], dx[:, 1])))
+        else:
+            self._L_baseline = np.nan
+
         # TODO: add the following paramaters as class attrs
         # xmin = np.min(np.abs(dx[:, 0] + 1j*dx[:, 1]))
         # xmax = np.max(np.abs(dx[:, 0] + 1j*dx[:, 1]))
@@ -425,16 +437,67 @@ class Arrays(_BaseClass):
             coords={"frequency": self.freqs, "time": _dataset["time"]},
         )
 
+        # local wavenumber magnitude k = |(kx, ky)| in rad/m. This is
+        # solved from the spatial phase gradients and is therefore an
+        # observed quantity, independent of any dispersion assumption.
+        wavenumber = xr.DataArray(
+            np.hypot(kx, ky),
+            dims = ["frequency", "time"],
+            coords={"frequency": self.freqs, "time": _dataset["time"]},
+        )
+
+        # local inverse phase speed nu = k / omega = k / (2 pi f),
+        # following Björkqvist et al. (2019), in s/m.
+        omega = 2 * np.pi * self.freqs
+        nu = wavenumber / xr.DataArray(
+            omega, dims=["frequency"], coords={"frequency": self.freqs}
+        )
+
         # compute wavelet power from wavelet coefficients
         data_std = _dataset["surface_elevation"].std("time")
         power = np.abs(coeffs) ** 2
         if self.normalise:
             wavelet_energy = power.mean("time").integrate("frequency")**0.5
             mean_power = (power * data_std / wavelet_energy).mean("element")
-        
-        return estimate_directional_distribution(
-            mean_power, theta, dd=self.dd, kappa=self.kappa
-        )
+        else:
+            mean_power = power.mean("element")
+
+        # frequency-direction spectrum (default, unchanged behaviour)
+        if self.coordinate in ("frequency", None):
+            return estimate_directional_distribution(
+                mean_power, theta, dd=self.dd, kappa=self.kappa
+            )
+
+        # wavenumber-direction or inverse-phase-speed-direction spectrum.
+        # The radial-KDE bandwidth is left to Silverman's data-driven rule
+        # (see `density._gaussian_radial_kde`), which together with the
+        # log-spaced default grid yields F(k)/Q(nu) spectra about as smooth
+        # as S(f) while keeping the spectral peak unbiased. An explicit
+        # `self.bandwidth_floor` (default None) is forwarded for callers who
+        # want to impose a physical lower bound on the kernel width; when
+        # None the kernel is only floored at the local bin spacing to guard
+        # against degenerate (zero-spread) radial samples.
+        elif self.coordinate == "wavenumber":
+            return estimate_radial_distribution(
+                mean_power, theta, wavenumber, "wavenumber",
+                bins_radial=self.bins_radial,
+                dd=self.dd, kappa=self.kappa, bandwidth=self.bandwidth,
+                bandwidth_floor=self.bandwidth_floor
+            )
+
+        elif self.coordinate == "nu":
+            return estimate_radial_distribution(
+                mean_power, theta, nu, "nu",
+                bins_radial=self.bins_radial,
+                dd=self.dd, kappa=self.kappa, bandwidth=self.bandwidth,
+                bandwidth_floor=self.bandwidth_floor
+            )
+
+        else:
+            raise Exception(
+                "`coordinate` should be either `frequency`, "
+                "`wavenumber` or `nu`."
+            )
 
 
     def compute(
@@ -449,6 +512,11 @@ class Arrays(_BaseClass):
             kappa: float = 36.0,
             use: str = "displacements",
             block_size: str = "30min",
+            coordinate: str = "frequency",
+            bins_radial: np.ndarray = None,
+            bins_per_octave: int = 24,
+            bandwidth: str = "silverman",
+            bandwidth_floor: float = None,
         ) -> xr.Dataset:
         """Perform computation using specified parameters.
 
@@ -483,6 +551,36 @@ class Arrays(_BaseClass):
                 computation over each block. The resulting output will have a
                 time dimension. It is advisable to choose values of no more than
                 half-hour. Default `block_size="30min"`.
+            coordinate (str, optional): Independent radial coordinate of the
+                output spectrum. One of `frequency` (default, the usual
+                frequency-direction spectrum), `wavenumber`, or `nu` (the
+                inverse phase speed nu = k / omega, yielding the Q(nu, theta)
+                spectrum of Björkqvist et al., 2019). The latter two are
+                available only for `Arrays` because they rely on the
+                wavenumber vector solved from the spatial phase gradients.
+            bins_radial (np.ndarray, optional): Bin centres for the radial
+                axis when `coordinate` is `wavenumber` (rad/m) or `nu`
+                (s/m). If None, a sensible range is derived from the data.
+                Ignored when `coordinate="frequency"`.
+            bins_per_octave (int, optional): Number of bins per octave for
+                the default log-spaced radial grid used when `bins_radial`
+                is None (default 24). Logarithmic spacing matches the
+                wavelet frequency grid and yields smoother F(k)/Q(nu)
+                spectra. Ignored when `bins_radial` is supplied or when
+                `coordinate="frequency"`.
+            bandwidth (str or float, optional): Bandwidth for the Gaussian
+                kernel used along the radial axis. Either a number or the
+                string `silverman` (default). Ignored when
+                `coordinate="frequency"`.
+            bandwidth_floor (float, optional): Physical lower bound on the
+                radial-kernel bandwidth, in the units of the radial
+                coordinate (rad/m for `wavenumber`, s/m for `nu`). Default
+                None, in which case Silverman's data-driven bandwidth is
+                used and only floored at the local bin spacing to guard
+                degenerate samples. Provide a value to impose a known
+                resolution limit (note the array baseline length is
+                available as `self._L_baseline` after `compute`). Ignored
+                when `coordinate="frequency"`.
 
         Returns:
             xr.Dataset: Dataset containing the directional spectrum, directional
@@ -512,6 +610,47 @@ class Arrays(_BaseClass):
         # data used for estimation
         self.use = use
         self.block_size = block_size
+
+        # radial coordinate of the output spectrum
+        self.coordinate = coordinate
+        self.bandwidth = bandwidth
+        self.bandwidth_floor = bandwidth_floor
+
+        # number of bins per octave for the default (log-spaced) radial
+        # grids. Logarithmic spacing mirrors the wavelet frequency grid
+        # `self.freqs` (also log-uniform), placing bins where the spectral
+        # structure is and rendering smoothly on the usual log-log axes.
+        # `nperoct` only controls how finely the radial KDE is *sampled*;
+        # the physical reliability of the result is governed by the kernel
+        # bandwidth and its `bandwidth_floor` (see `compute_spectrum`), not
+        # by the bin count.
+        self.bins_per_octave = bins_per_octave
+
+        # default radial bins if none are provided. We keep the
+        # Björkqvist et al. (2019) span — wavenumber over roughly
+        # [1/12, 9] rad/m and inverse phase speed nu = k / omega bounded by
+        # the slowest resolved wave — but distribute the bins
+        # logarithmically rather than linearly so the omnidirectional F(k)
+        # and Q(nu) spectra look as smooth as the frequency spectrum S(f).
+        # The lower bound stays one Björkqvist bin-width above zero so the
+        # polar directional spectrum (which carries a 1/r Jacobian) has no
+        # singular bin at the origin.
+        def _logbins(lo, hi, nperoct):
+            noct = np.log2(hi / lo)
+            npts = int(np.ceil(nperoct * noct)) + 1
+            return 2.0 ** np.linspace(np.log2(lo), np.log2(hi), npts)
+
+        if bins_radial is None and coordinate == "wavenumber":
+            k_lo = 1.0 / 12.0
+            k_hi = 9.0
+            self.bins_radial = _logbins(k_lo, k_hi, self.bins_per_octave)
+        elif bins_radial is None and coordinate == "nu":
+            nu_lo = 1.0 / 50.0
+            nu_hi = 9.0 / (2 * np.pi * self.freqs[0])
+            nu_hi = min(nu_hi, 2.0)  # cap at a physically reasonable slowness
+            self.bins_radial = _logbins(nu_lo, nu_hi, self.bins_per_octave)
+        else:
+            self.bins_radial = bins_radial
 
         # determine length of time series
         # if dataset contains more than one hour of data, it will be splitted
