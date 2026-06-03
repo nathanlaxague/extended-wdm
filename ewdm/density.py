@@ -15,16 +15,26 @@ _trapezoid = getattr(np, "trapezoid", getattr(np, "trapz", None))
 
 
 # von mises kernel desnsity estimation
-def _vonmises_kde(arr, bins, kappa):
-    """Return Kernel-Density Estimation using von Mises distribution"""
+def _vonmises_kde(arr, bins, kappa, weights=None):
+    """Return Kernel-Density Estimation using von Mises distribution.
+
+    When ``weights`` is given (per-sample, e.g. wavelet power), each kernel is
+    weighted by it before summing, so the estimate is the variance-weighted
+    distribution (the canonical WDM construction) rather than the unweighted
+    sample occurrence. Normalised to unit integral over ``bins`` either way."""
+
+    m = np.isfinite(arr)
+    a = arr[m]
+    w = None if weights is None else np.asarray(weights)[m]
 
     # define input parameters
-    x = np.radians(bins[:,None] - arr[None,:])
+    x = np.radians(bins[:, None] - a[None, :])
 
-    # integrate vonmises kernels
-    kde = (
-        np.exp(kappa * np.cos(x)).sum(axis=1) / (2 * np.pi * np.i0(kappa))
-    )
+    # integrate (optionally weighted) vonmises kernels
+    ker = np.exp(kappa * np.cos(x))
+    if w is not None:
+        ker = ker * w[None, :]
+    kde = ker.sum(axis=1) / (2 * np.pi * np.i0(kappa))
     kde /= _trapezoid(kde, x=bins)
     return kde
 
@@ -43,28 +53,43 @@ def _gaussian_kde(arr, bins, bandwidth='silverman'):
 
 
 # function to get histogram along freq axis
-def _get_density(arr, bins, kappa):
+def _get_density(arr, bins, kappa, weights=None):
     if np.isnan(arr).all():
         return np.zeros_like(bins, dtype="float") * np.nan
     else:
         if kappa is not None:
-            return _vonmises_kde(arr[~np.isnan(arr)], bins=bins, kappa=kappa)
+            return _vonmises_kde(arr, bins=bins, kappa=kappa, weights=weights)
         else:
+            m = np.isfinite(arr)
+            w = None if weights is None else np.asarray(weights)[m]
             bins_edges = np.r_[bins, bins[-1]+np.diff(bins)[0]]
-            return np.histogram(arr, bins=bins_edges, density=True)[0]
+            return np.histogram(arr[m], bins=bins_edges, weights=w,
+                                density=True)[0]
 
 
 # function to actually estimate the spectrum
-def estimate_directional_distribution(power, theta, dd, kappa):
-    """Construct directional distribution function from local wave directions"""
+def estimate_directional_distribution(power, theta, dd, kappa,
+                                      power_weighted=False):
+    """Construct directional distribution function from local wave directions.
+
+    power_weighted (bool): if True, weight each (frequency, time) direction by
+    its wavelet power when forming D(f, theta) -- i.e. bin the variance, the
+    canonical WDM construction -- instead of the unweighted sample occurrence.
+    Leaves the frequency spectrum S(f) = <power>_t unchanged.
+    """
 
     # array of directiontions where dd is the directional resolution
     bins = np.arange(-180, 180, dd)
 
     # directional distribution function
-    D = np.apply_along_axis(
-        _get_density, arr=theta, bins=bins, kappa=kappa, axis=1
-    )
+    if power_weighted:
+        th = np.asarray(theta); pw = np.asarray(power)
+        D = np.stack([_get_density(th[f], bins, kappa, weights=pw[f])
+                      for f in range(th.shape[0])])
+    else:
+        D = np.apply_along_axis(
+            _get_density, arr=theta, bins=bins, kappa=kappa, axis=1
+        )
 
     # determine average wavelet power
     S = power.mean("time").data
@@ -93,7 +118,8 @@ def estimate_directional_distribution(power, theta, dd, kappa):
 
 
 # kernel density estimation along a radial (non-periodic) axis {{{
-def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None):
+def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None,
+                         weights=None):
     """Return Gaussian Kernel-Density Estimation along a radial axis.
 
     Unlike the directional case, the radial coordinate (wavenumber or
@@ -123,6 +149,10 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None)
         np.ndarray: Normalised density evaluated at `bins`.
     """
 
+    m = np.isfinite(arr)
+    arr = arr[m]
+    w = None if weights is None else np.asarray(weights)[m]
+
     if bandwidth == "silverman":
         bandwidth = 1.06 * arr.std() * len(arr) ** (-1. / 5.)
 
@@ -146,7 +176,10 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None)
 
     x = (bins[:, None] - arr[None, :]) / bandwidth
     fac = 1 / np.sqrt(2 * np.pi)
-    kde = (fac * np.exp(-0.5 * x**2)).sum(axis=1) / (len(arr) * bandwidth)
+    ker = fac * np.exp(-0.5 * x**2)
+    if w is not None:
+        ker = ker * w[None, :]
+    kde = ker.sum(axis=1) / (len(arr) * bandwidth)
 
     # normalise to unit integral over the radial bins. np.trapezoid was
     # introduced in numpy 2.0 as the replacement for np.trapz; fall back
@@ -158,21 +191,69 @@ def _gaussian_radial_kde(arr, bins, bandwidth="silverman", bandwidth_floor=None)
     return kde
 
 
+def _relative_radial_kde(arr, bins, bandwidth, weights=None):
+    """Gaussian KDE in ``log`` radial coordinate: a constant *relative*
+    (fractional) kernel width, so the smoothing is a fixed percentage of the
+    radial value rather than a fixed absolute width. This avoids the absolute
+    kernel over-smoothing the steep short-wave (high radial) tail. ``bandwidth``
+    is the fractional log-space standard deviation (e.g. 0.08). Normalised to
+    unit integral over the linear ``bins``. ``weights`` (per-sample) weights
+    each kernel before summing (variance-weighted distribution)."""
+    m = np.isfinite(arr) & (arr > 0)
+    a = arr[m]
+    w = None if weights is None else np.asarray(weights)[m]
+    if a.size == 0:
+        return np.zeros_like(bins, dtype="float")
+    x = (np.log(bins)[:, None] - np.log(a)[None, :]) / bandwidth
+    ker = np.exp(-0.5 * x**2)
+    if w is not None:
+        ker = ker * w[None, :]
+    kde = ker.sum(axis=1) / bins
+    _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    area = _trapz(kde, x=bins)
+    return kde / area if area > 0 else kde
+
+
+def _histogram_radial(arr, bins, weights=None):
+    """Raw (un-smoothed) density: a histogram of the samples into bins whose
+    edges are the mid-points of ``bins``, divided by bin width and normalised to
+    unit integral. ``weights`` (per-sample, e.g. power) gives the variance-
+    weighted histogram. Use to inspect the bare measured-radial distribution
+    without any kernel smoothing."""
+    m = np.isfinite(arr) & (arr > 0)
+    a = arr[m]
+    w = None if weights is None else np.asarray(weights)[m]
+    if a.size == 0:
+        return np.zeros_like(bins, dtype="float")
+    mids = 0.5 * (bins[:-1] + bins[1:])
+    edges = np.concatenate(([bins[0] - (mids[0] - bins[0])], mids,
+                            [bins[-1] + (bins[-1] - mids[-1])]))
+    dens = np.histogram(a, bins=edges, weights=w)[0] / np.diff(edges)
+    _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    area = _trapz(dens, x=bins)
+    return dens / area if area > 0 else dens
+
+
 # function to get radial density along the frequency axis
-def _get_radial_density(arr, bins, bandwidth, bandwidth_floor=None):
+def _get_radial_density(arr, bins, bandwidth, bandwidth_floor=None,
+                        bandwidth_mode="absolute", weights=None):
     if np.isnan(arr).all():
         return np.zeros_like(bins, dtype="float") * np.nan
-    else:
-        return _gaussian_radial_kde(arr[~np.isnan(arr)], bins=bins,
-                                    bandwidth=bandwidth,
-                                    bandwidth_floor=bandwidth_floor)
+    if bandwidth_mode == "relative":
+        return _relative_radial_kde(arr, bins=bins, bandwidth=bandwidth,
+                                    weights=weights)
+    elif bandwidth_mode == "histogram":
+        return _histogram_radial(arr, bins=bins, weights=weights)
+    return _gaussian_radial_kde(arr, bins=bins, bandwidth=bandwidth,
+                                bandwidth_floor=bandwidth_floor, weights=weights)
 # }}}
 
 
 # estimate spectrum on a (radial, direction) grid {{{
 def estimate_radial_distribution(
         power, theta, radial, radial_name, bins_radial,
-        dd, kappa, bandwidth="silverman", bandwidth_floor=None
+        dd, kappa, bandwidth="silverman", bandwidth_floor=None,
+        bandwidth_mode="absolute", power_weighted=False
     ):
     """Construct a directional spectrum on a (radial, direction) grid.
 
@@ -213,6 +294,23 @@ def estimate_radial_distribution(
             equivalent for ``nu``). Prevents the smoothed spectrum from
             implying structure finer than the array can resolve. When
             None, the kernel is floored at the local bin spacing instead.
+            Only used when ``bandwidth_mode == "absolute"``.
+        bandwidth_mode (str): How ``bandwidth`` is interpreted along the
+            radial axis. ``"absolute"`` (default) is a fixed-width Gaussian
+            kernel in the radial coordinate (Silverman or a number).
+            ``"relative"`` is a Gaussian in ``log`` radial with a constant
+            *fractional* width (``bandwidth`` is the fractional log-space
+            sigma, e.g. 0.08), which smooths a fixed percentage of k/nu and
+            so preserves the slope of a steep short-wave tail. ``"histogram"``
+            applies no smoothing (raw weighted histogram), exposing the bare
+            measured-radial distribution.
+        power_weighted (bool): if True, weight each (frequency, time) radial and
+            directional sample by its wavelet power when forming R(f, r) and
+            D(f, theta) -- i.e. bin the variance (the canonical WDM
+            construction) rather than the unweighted sample occurrence. The
+            low-power high-radial scatter is then no longer over-counted, which
+            preserves the steep short-wave (saturation) slope. The total
+            variance and S(f) are unchanged.
 
     Returns:
         xr.Dataset: Dataset containing the directional spectrum
@@ -225,19 +323,28 @@ def estimate_radial_distribution(
     # directional and radial bin arrays
     bins_dir = np.arange(-180, 180, dd)
 
-    # directional distribution function D(f, theta), reusing the von
-    # Mises kernel of the frequency-direction path
-    D = np.apply_along_axis(
-        _get_density, arr=np.asarray(theta), bins=bins_dir,
-        kappa=kappa, axis=1
-    )
-
-    # radial distribution function R(f, r) using a Gaussian kernel along
-    # the non-periodic radial axis
-    R = np.apply_along_axis(
-        _get_radial_density, arr=np.asarray(radial), bins=bins_radial,
-        bandwidth=bandwidth, bandwidth_floor=bandwidth_floor, axis=1
-    )
+    # directional D(f, theta) and radial R(f, r) distribution functions.
+    # When power_weighted, each (f, t) sample is weighted by its wavelet power
+    # (variance binning) -- looped per frequency so radial/theta and the weights
+    # stay paired; otherwise the vectorised apply_along_axis path is used.
+    th = np.asarray(theta); rad = np.asarray(radial)
+    if power_weighted:
+        pw = np.asarray(power)
+        D = np.stack([_get_density(th[f], bins_dir, kappa, weights=pw[f])
+                      for f in range(th.shape[0])])
+        R = np.stack([_get_radial_density(rad[f], bins_radial, bandwidth,
+                                          bandwidth_floor, bandwidth_mode,
+                                          weights=pw[f])
+                      for f in range(rad.shape[0])])
+    else:
+        D = np.apply_along_axis(
+            _get_density, arr=th, bins=bins_dir, kappa=kappa, axis=1
+        )
+        R = np.apply_along_axis(
+            _get_radial_density, arr=rad, bins=bins_radial,
+            bandwidth=bandwidth, bandwidth_floor=bandwidth_floor,
+            bandwidth_mode=bandwidth_mode, axis=1
+        )
 
     # average wavelet power per frequency, S(f). This is the same
     # quantity used by the frequency-direction path, so the absolute
